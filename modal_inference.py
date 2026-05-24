@@ -31,10 +31,16 @@ app = modal.App("lens-inference", image=image)
 # Persistent volume for HuggingFace model cache to avoid re-downloading weights on every run
 hf_volume = modal.Volume.from_name("hf-cache-vol", create_if_missing=True)
 
+# Persistent volume for generated output images
+outputs_volume = modal.Volume.from_name("lens-outputs-vol", create_if_missing=True)
+
 
 @app.function(
-    gpu="A100",  # Hopper-or-newer is recommended for native MXFP4 dequantization support
-    volumes={"/root/.cache/huggingface": hf_volume},
+    gpu="A10G",  # Hopper-or-newer is recommended for native MXFP4 dequantization support
+    volumes={
+        "/root/.cache/huggingface": hf_volume,
+        "/outputs": outputs_volume,
+    },
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=1800,
 )
@@ -54,7 +60,8 @@ def run_remote_inference(
     api_key: str = None,
     api_model: str = None,
     offload: bool = False,
-) -> list[tuple[str, bytes]]:
+    out: str = "/outputs",
+) -> list[str]:
     """Runs text-to-image inference on the remote Modal GPU container."""
     import torch
     from lens import LensGptOssEncoder, LensPipeline
@@ -110,7 +117,7 @@ def run_remote_inference(
     )
 
     print(f"Running generation for {len(prompts)} prompt(s) with steps={steps}, cfg={cfg}, n={n}...")
-    out = pipe(
+    pipeline_output = pipe(
         prompt=prompts,
         base_resolution=base_resolution,
         aspect_ratio=aspect_ratio,
@@ -121,27 +128,28 @@ def run_remote_inference(
         enable_reasoner=reasoner,
     )
 
-    images = list(out.images)
+    images = list(pipeline_output.images)
     expected_images = len(prompts) * n
     if len(images) != expected_images:
         raise RuntimeError(
             f"Pipeline returned {len(images)} images; expected {expected_images}."
         )
 
-    # Save images to in-memory bytes to return back to the local host machine
-    results = []
+    # Save images directly to the mounted Volume directory
+    saved_paths = []
+    os.makedirs(out, exist_ok=True)
     img_iter = iter(images)
     for p_idx, p in enumerate(prompts):
         for s_idx in range(n):
             img = next(img_iter)
             fname = f"p{p_idx:03d}_s{s_idx:02d}.png"
-            
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            img_bytes = buf.getvalue()
-            
-            results.append((fname, img_bytes))
-            print(f"Generated {fname} :: {p!r}")
+            dest_path = os.path.join(out, fname)
+            img.save(dest_path)
+            saved_paths.append(dest_path)
+            print(f"Saved {fname} to Volume path {dest_path} :: {p!r}")
+
+    # Commit changes to ensure they are visible on the volume
+    outputs_volume.commit()
 
     refined = getattr(pipe, "_last_refined_prompts", prompts)
     if any(r != orig for r, orig in zip(refined, prompts)):
@@ -149,7 +157,7 @@ def run_remote_inference(
         for orig, ref in zip(prompts, refined):
             print(f"  {orig!r}\n    -> {ref!r}")
 
-    return results
+    return saved_paths
 
 
 @app.local_entrypoint()
@@ -162,7 +170,7 @@ def main(
     cfg: float = 5.0,
     n: int = 1,
     seed: int = None,
-    out: str = "./outputs",
+    out: str = "/outputs",
     dtype: str = "bfloat16",
     disable_mxfp4: bool = False,
     reasoner: bool = False,
@@ -173,10 +181,10 @@ def main(
 ):
     """
     Trigger inference remotely on the Modal platform.
-    Generated images are downloaded and saved locally in the 'out' directory.
+    Generated images are saved to a persistent Modal Volume.
     """
     print(f"Triggering remote inference on Modal for prompt: {prompt!r}")
-    results = run_remote_inference.remote(
+    saved_paths = run_remote_inference.remote(
         prompt=prompt,
         repo_id=repo_id,
         base_resolution=base_resolution,
@@ -192,12 +200,9 @@ def main(
         api_key=api_key,
         api_model=api_model,
         offload=offload,
+        out=out,
     )
 
-    # Save received image bytes to the local output folder
-    os.makedirs(out, exist_ok=True)
-    for fname, img_bytes in results:
-        local_path = os.path.join(out, fname)
-        with open(local_path, "wb") as f:
-            f.write(img_bytes)
-        print(f"Saved generated image to {local_path}")
+    print("\nInference complete! Images successfully saved inside Modal Volume:")
+    for path in saved_paths:
+        print(f"  - {path}")
