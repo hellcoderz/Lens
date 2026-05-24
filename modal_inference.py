@@ -41,7 +41,7 @@ progress_dict = modal.Dict.from_name("lens-progress-dict", create_if_missing=Tru
 
 
 @app.function(
-    gpu="A10G",  # Hopper-or-newer is recommended for native MXFP4 dequantization support
+    gpu="A100",  # Hopper-or-newer is recommended for native MXFP4 dequantization support
     volumes={
         "/root/.cache/huggingface": hf_volume,
         "/outputs": outputs_volume,
